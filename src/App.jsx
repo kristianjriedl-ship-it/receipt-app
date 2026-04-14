@@ -252,9 +252,7 @@ export default function App() {
     setReadingReceipt(true)
 
     try {
-      const result = await parseReceiptFromImage(file)
-      const raw = result?.raw || ''
-      const parsed = safeJsonParse(raw)
+      const parsed = await parseReceiptFromImage(file)
 
       if (parsed) {
         setForm((prev) => ({
