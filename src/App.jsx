@@ -39,6 +39,14 @@ function getFinancialYear(dateValue) {
     : `${year - 1}-${String(year).slice(-2)}`
 }
 
+function safeJsonParse(text) {
+  try {
+    return JSON.parse(text)
+  } catch {
+    return null
+  }
+}
+
 export default function App() {
   const [session, setSession] = useState(null)
   const [loading, setLoading] = useState(true)
@@ -69,6 +77,7 @@ export default function App() {
   })
 
   const [saving, setSaving] = useState(false)
+  const [readingReceipt, setReadingReceipt] = useState(false)
 
   useEffect(() => {
     if (!supabase) {
@@ -145,13 +154,13 @@ export default function App() {
         role: membership.role,
       })
 
-      const { data: categoryRows, error: categoryError } = await supabase
+      const { data: categoryRows } = await supabase
         .from('categories')
         .select('*')
         .eq('workspace_id', membership.workspaces.id)
         .order('name')
 
-      if (!categoryError && categoryRows?.length) {
+      if (categoryRows?.length) {
         setCategories(categoryRows.map((row) => row.name))
       } else {
         setCategories(FALLBACK_CATEGORIES)
@@ -202,10 +211,78 @@ export default function App() {
     setReceipts([])
   }
 
-  function onPickFile(file) {
+  async function parseReceiptFromImage(file) {
+    if (!supabase || !session?.user) return null
+
+    const ext = file.name.split('.').pop() || 'jpg'
+    const tempPath = `${session.user.id}/temp-${Date.now()}-${Math.random()
+      .toString(36)
+      .slice(2)}.${ext}`
+
+    const { error: uploadError } = await supabase.storage
+      .from('receipt-images')
+      .upload(tempPath, file, { upsert: false })
+
+    if (uploadError) throw uploadError
+
+    const { data: signedData, error: signedError } = await supabase.storage
+      .from('receipt-images')
+      .createSignedUrl(tempPath, 60)
+
+    if (signedError) throw signedError
+
+    const { data, error: functionError } = await supabase.functions.invoke(
+      'parse-receipt',
+      {
+        body: { imageUrl: signedData.signedUrl },
+      }
+    )
+
+    if (functionError) throw functionError
+    return data
+  }
+
+  async function onPickFile(file) {
     if (!file) return
+
     const previewUrl = URL.createObjectURL(file)
     setForm((prev) => ({ ...prev, file, previewUrl }))
+    setError('')
+    setInfo('Reading receipt...')
+    setReadingReceipt(true)
+
+    try {
+      const result = await parseReceiptFromImage(file)
+      const raw = result?.raw || ''
+      const parsed = safeJsonParse(raw)
+
+      if (parsed) {
+        setForm((prev) => ({
+          ...prev,
+          file,
+          previewUrl,
+          vendor: parsed.vendor || prev.vendor,
+          amount:
+            parsed.amount && Number(parsed.amount) > 0
+              ? String(parsed.amount)
+              : prev.amount,
+          receiptDate: parsed.receipt_date || prev.receiptDate,
+          category:
+            parsed.category_guess &&
+            [...categories, ...FALLBACK_CATEGORIES].includes(parsed.category_guess)
+              ? parsed.category_guess
+              : prev.category,
+        }))
+        setInfo('Receipt read successfully.')
+      } else {
+        setInfo('Photo uploaded. Could not auto-fill this one.')
+      }
+    } catch (err) {
+      setError(err.message || 'Could not read receipt photo')
+      setInfo('')
+    } finally {
+      setReadingReceipt(false)
+    }
   }
 
   function resetForm() {
@@ -231,7 +308,9 @@ export default function App() {
 
       if (form.file) {
         const ext = form.file.name.split('.').pop() || 'jpg'
-        const path = `${session.user.id}/${Date.now()}-${Math.random().toString(36).slice(2)}.${ext}`
+        const path = `${session.user.id}/${Date.now()}-${Math.random()
+          .toString(36)
+          .slice(2)}.${ext}`
 
         const { error: uploadError } = await supabase.storage
           .from('receipt-images')
@@ -276,6 +355,7 @@ export default function App() {
       if (itemError) throw itemError
 
       resetForm()
+      setInfo('Receipt saved.')
       await loadAppData(session.user.id)
     } catch (err) {
       setError(err.message || 'Could not save receipt')
@@ -324,21 +404,35 @@ export default function App() {
 
   const filteredReceipts = useMemo(() => {
     return receipts.filter((receipt) => {
-      const haystack = `${receipt.vendor} ${receipt.notes || ''} ${receipt.cost_centre || ''}`.toLowerCase()
+      const haystack = `${receipt.vendor} ${receipt.notes || ''} ${
+        receipt.cost_centre || ''
+      }`.toLowerCase()
       const searchMatch = haystack.includes(search.toLowerCase())
-      const statusMatch = statusFilter === 'All' || receipt.status === statusFilter
-      const fyMatch = financialYearFilter === 'All' || receipt.financial_year === financialYearFilter
+      const statusMatch =
+        statusFilter === 'All' || receipt.status === statusFilter
+      const fyMatch =
+        financialYearFilter === 'All' ||
+        receipt.financial_year === financialYearFilter
       return searchMatch && statusMatch && fyMatch
     })
   }, [receipts, search, statusFilter, financialYearFilter])
 
-  const total = filteredReceipts.reduce((sum, receipt) => sum + Number(receipt.amount || 0), 0)
+  const total = filteredReceipts.reduce(
+    (sum, receipt) => sum + Number(receipt.amount || 0),
+    0
+  )
   const pending = receipts.filter((r) => r.status === 'Pending').length
   const isOwner = workspace?.role === 'Owner'
   const isSubmitter = workspace?.role === 'Submitter'
-  const myReceipts = filteredReceipts.filter((r) => r.submitted_by === session?.user?.id)
+  const myReceipts = filteredReceipts.filter(
+    (r) => r.submitted_by === session?.user?.id
+  )
 
-  const financialYears = [...new Set(receipts.map((r) => r.financial_year).filter(Boolean))].sort().reverse()
+  const financialYears = [
+    ...new Set(receipts.map((r) => r.financial_year).filter(Boolean)),
+  ]
+    .sort()
+    .reverse()
 
   const categoryTotals = categories
     .map((category) => {
@@ -358,7 +452,9 @@ export default function App() {
   if (!SUPABASE_URL || !SUPABASE_ANON_KEY) {
     return (
       <div style={styles.page}>
-        <div style={styles.card}><h2>Supabase environment variables missing</h2></div>
+        <div style={styles.card}>
+          <h2>Supabase environment variables missing</h2>
+        </div>
       </div>
     )
   }
@@ -387,7 +483,9 @@ export default function App() {
             type="email"
           />
 
-          <button style={styles.primaryButton} onClick={sendMagicLink}>Email me a sign-in link</button>
+          <button style={styles.primaryButton} onClick={sendMagicLink}>
+            Email me a sign-in link
+          </button>
 
           {info ? <p style={styles.info}>{info}</p> : null}
           {error ? <p style={styles.errorText}>{error}</p> : null}
@@ -412,23 +510,38 @@ export default function App() {
           <p style={styles.muted}>Simple shared receipt capture for two users.</p>
           <div style={styles.metaRow}>
             <span>{profile?.full_name || session.user.email}</span>
-            <span>{workspace ? `${workspace.name} · ${workspace.role}` : 'No workspace linked yet'}</span>
+            <span>
+              {workspace
+                ? `${workspace.name} · ${workspace.role}`
+                : 'No workspace linked yet'}
+            </span>
           </div>
         </div>
 
         <div style={styles.card}>
-          <div style={styles.statRow}><span>Visible total</span><strong>{money(total)}</strong></div>
-          <div style={styles.statRow}><span>Pending</span><strong>{pending}</strong></div>
-          <button style={styles.button} onClick={signOut}>Sign out</button>
+          <div style={styles.statRow}>
+            <span>Visible total</span>
+            <strong>{money(total)}</strong>
+          </div>
+          <div style={styles.statRow}>
+            <span>Pending</span>
+            <strong>{pending}</strong>
+          </div>
+          <button style={styles.button} onClick={signOut}>
+            Sign out
+          </button>
         </div>
       </div>
 
       {error ? <div style={styles.errorBanner}>{error}</div> : null}
+      {info ? <div style={styles.infoBanner}>{info}</div> : null}
 
       {!workspace ? (
         <div style={styles.card}>
           <h2>One-time setup still needed</h2>
-          <p style={styles.muted}>Your user exists, but you have not been added to a workspace yet.</p>
+          <p style={styles.muted}>
+            Your user exists, but you have not been added to a workspace yet.
+          </p>
         </div>
       ) : isSubmitter ? (
         <div style={styles.mobileWrap}>
@@ -437,37 +550,112 @@ export default function App() {
             <p style={styles.muted}>Take a photo and save it fast.</p>
 
             <label style={styles.primaryButtonLabel}>
-              <input type="file" accept="image/*" capture="environment" style={{ display: 'none' }} onChange={(e) => onPickFile(e.target.files?.[0])} />
-              Take photo
+              <input
+                type="file"
+                accept="image/*"
+                capture="environment"
+                style={{ display: 'none' }}
+                onChange={(e) => onPickFile(e.target.files?.[0])}
+              />
+              {readingReceipt ? 'Reading receipt...' : 'Take photo'}
             </label>
 
             <label style={styles.secondaryButtonLabel}>
-              <input type="file" accept="image/*" style={{ display: 'none' }} onChange={(e) => onPickFile(e.target.files?.[0])} />
+              <input
+                type="file"
+                accept="image/*"
+                style={{ display: 'none' }}
+                onChange={(e) => onPickFile(e.target.files?.[0])}
+              />
               Upload from phone
             </label>
 
-            {form.previewUrl ? <img src={form.previewUrl} alt="Receipt preview" style={styles.preview} /> : null}
+            {form.previewUrl ? (
+              <img
+                src={form.previewUrl}
+                alt="Receipt preview"
+                style={styles.preview}
+              />
+            ) : null}
 
-            <input style={styles.input} placeholder="Vendor" value={form.vendor} onChange={(e) => setForm((prev) => ({ ...prev, vendor: e.target.value }))} />
-            <input style={styles.input} placeholder="Amount" type="number" step="0.01" value={form.amount} onChange={(e) => setForm((prev) => ({ ...prev, amount: e.target.value }))} />
-            <select style={styles.input} value={form.category} onChange={(e) => setForm((prev) => ({ ...prev, category: e.target.value }))}>
-              {categories.map((category) => <option key={category}>{category}</option>)}
+            <input
+              style={styles.input}
+              placeholder="Vendor"
+              value={form.vendor}
+              onChange={(e) =>
+                setForm((prev) => ({ ...prev, vendor: e.target.value }))
+              }
+            />
+            <input
+              style={styles.input}
+              placeholder="Amount"
+              type="number"
+              step="0.01"
+              value={form.amount}
+              onChange={(e) =>
+                setForm((prev) => ({ ...prev, amount: e.target.value }))
+              }
+            />
+            <select
+              style={styles.input}
+              value={form.category}
+              onChange={(e) =>
+                setForm((prev) => ({ ...prev, category: e.target.value }))
+              }
+            >
+              {categories.map((category) => (
+                <option key={category}>{category}</option>
+              ))}
             </select>
-            <input style={styles.input} type="date" value={form.receiptDate} onChange={(e) => setForm((prev) => ({ ...prev, receiptDate: e.target.value }))} />
-            <div style={styles.helperText}>Financial year: {getFinancialYear(form.receiptDate) || '-'}</div>
-            <input style={styles.input} placeholder="Cost centre" value={form.costCentre} onChange={(e) => setForm((prev) => ({ ...prev, costCentre: e.target.value }))} />
-            <textarea style={{ ...styles.input, minHeight: 90 }} placeholder="Notes" value={form.notes} onChange={(e) => setForm((prev) => ({ ...prev, notes: e.target.value }))} />
-            <button style={styles.primaryButton} onClick={saveReceipt} disabled={saving}>{saving ? 'Saving...' : 'Save receipt'}</button>
+            <input
+              style={styles.input}
+              type="date"
+              value={form.receiptDate}
+              onChange={(e) =>
+                setForm((prev) => ({ ...prev, receiptDate: e.target.value }))
+              }
+            />
+            <div style={styles.helperText}>
+              Financial year: {getFinancialYear(form.receiptDate) || '-'}
+            </div>
+            <input
+              style={styles.input}
+              placeholder="Cost centre"
+              value={form.costCentre}
+              onChange={(e) =>
+                setForm((prev) => ({ ...prev, costCentre: e.target.value }))
+              }
+            />
+            <textarea
+              style={{ ...styles.input, minHeight: 90 }}
+              placeholder="Notes"
+              value={form.notes}
+              onChange={(e) =>
+                setForm((prev) => ({ ...prev, notes: e.target.value }))
+              }
+            />
+            <button
+              style={styles.primaryButton}
+              onClick={saveReceipt}
+              disabled={saving}
+            >
+              {saving ? 'Saving...' : 'Save receipt'}
+            </button>
           </div>
 
           <div style={styles.card}>
             <h2>My recent receipts</h2>
-            {myReceipts.length === 0 ? <p style={styles.muted}>No receipts yet.</p> : null}
+            {myReceipts.length === 0 ? (
+              <p style={styles.muted}>No receipts yet.</p>
+            ) : null}
             {myReceipts.map((receipt) => (
               <div key={receipt.id} style={styles.receiptRow}>
                 <div>
                   <strong>{receipt.vendor}</strong>
-                  <div style={styles.smallMuted}>{receipt.status} · {receipt.receipt_date} · {receipt.financial_year || '-'}</div>
+                  <div style={styles.smallMuted}>
+                    {receipt.status} · {receipt.receipt_date} ·{' '}
+                    {receipt.financial_year || '-'}
+                  </div>
                 </div>
                 <strong>{money(receipt.amount)}</strong>
               </div>
@@ -479,80 +667,195 @@ export default function App() {
           <div style={styles.leftCol}>
             <div style={styles.card}>
               <h2>Owner tools</h2>
+
               <label style={styles.primaryButtonLabel}>
-                <input type="file" accept="image/*" capture="environment" style={{ display: 'none' }} onChange={(e) => onPickFile(e.target.files?.[0])} />
-                Take photo
+                <input
+                  type="file"
+                  accept="image/*"
+                  capture="environment"
+                  style={{ display: 'none' }}
+                  onChange={(e) => onPickFile(e.target.files?.[0])}
+                />
+                {readingReceipt ? 'Reading receipt...' : 'Take photo'}
               </label>
 
               <label style={styles.secondaryButtonLabel}>
-                <input type="file" accept="image/*" style={{ display: 'none' }} onChange={(e) => onPickFile(e.target.files?.[0])} />
+                <input
+                  type="file"
+                  accept="image/*"
+                  style={{ display: 'none' }}
+                  onChange={(e) => onPickFile(e.target.files?.[0])}
+                />
                 Upload file
               </label>
 
-              {form.previewUrl ? <img src={form.previewUrl} alt="Receipt preview" style={styles.preview} /> : null}
+              {form.previewUrl ? (
+                <img
+                  src={form.previewUrl}
+                  alt="Receipt preview"
+                  style={styles.preview}
+                />
+              ) : null}
 
-              <input style={styles.input} placeholder="Vendor" value={form.vendor} onChange={(e) => setForm((prev) => ({ ...prev, vendor: e.target.value }))} />
-              <input style={styles.input} placeholder="Amount" type="number" step="0.01" value={form.amount} onChange={(e) => setForm((prev) => ({ ...prev, amount: e.target.value }))} />
-              <select style={styles.input} value={form.category} onChange={(e) => setForm((prev) => ({ ...prev, category: e.target.value }))}>
-                {categories.map((category) => <option key={category}>{category}</option>)}
+              <input
+                style={styles.input}
+                placeholder="Vendor"
+                value={form.vendor}
+                onChange={(e) =>
+                  setForm((prev) => ({ ...prev, vendor: e.target.value }))
+                }
+              />
+              <input
+                style={styles.input}
+                placeholder="Amount"
+                type="number"
+                step="0.01"
+                value={form.amount}
+                onChange={(e) =>
+                  setForm((prev) => ({ ...prev, amount: e.target.value }))
+                }
+              />
+              <select
+                style={styles.input}
+                value={form.category}
+                onChange={(e) =>
+                  setForm((prev) => ({ ...prev, category: e.target.value }))
+                }
+              >
+                {categories.map((category) => (
+                  <option key={category}>{category}</option>
+                ))}
               </select>
-              <input style={styles.input} type="date" value={form.receiptDate} onChange={(e) => setForm((prev) => ({ ...prev, receiptDate: e.target.value }))} />
-              <div style={styles.helperText}>Financial year: {getFinancialYear(form.receiptDate) || '-'}</div>
-              <input style={styles.input} placeholder="Cost centre" value={form.costCentre} onChange={(e) => setForm((prev) => ({ ...prev, costCentre: e.target.value }))} />
-              <textarea style={{ ...styles.input, minHeight: 90 }} placeholder="Notes" value={form.notes} onChange={(e) => setForm((prev) => ({ ...prev, notes: e.target.value }))} />
-              <button style={styles.primaryButton} onClick={saveReceipt} disabled={saving}>{saving ? 'Saving...' : 'Save receipt'}</button>
+              <input
+                style={styles.input}
+                type="date"
+                value={form.receiptDate}
+                onChange={(e) =>
+                  setForm((prev) => ({ ...prev, receiptDate: e.target.value }))
+                }
+              />
+              <div style={styles.helperText}>
+                Financial year: {getFinancialYear(form.receiptDate) || '-'}
+              </div>
+              <input
+                style={styles.input}
+                placeholder="Cost centre"
+                value={form.costCentre}
+                onChange={(e) =>
+                  setForm((prev) => ({ ...prev, costCentre: e.target.value }))
+                }
+              />
+              <textarea
+                style={{ ...styles.input, minHeight: 90 }}
+                placeholder="Notes"
+                value={form.notes}
+                onChange={(e) =>
+                  setForm((prev) => ({ ...prev, notes: e.target.value }))
+                }
+              />
+              <button
+                style={styles.primaryButton}
+                onClick={saveReceipt}
+                disabled={saving}
+              >
+                {saving ? 'Saving...' : 'Save receipt'}
+              </button>
 
               <label style={styles.label}>Add category</label>
-              <input style={styles.input} placeholder="New category" value={newCategory} onChange={(e) => setNewCategory(e.target.value)} />
-              <button style={styles.button} onClick={addCategory}>Add category</button>
+              <input
+                style={styles.input}
+                placeholder="New category"
+                value={newCategory}
+                onChange={(e) => setNewCategory(e.target.value)}
+              />
+              <button style={styles.button} onClick={addCategory}>
+                Add category
+              </button>
             </div>
 
             <div style={styles.card}>
               <h2>Filters</h2>
+
               <label style={styles.label}>Search</label>
-              <input style={styles.input} placeholder="Vendor, notes, cost centre" value={search} onChange={(e) => setSearch(e.target.value)} />
+              <input
+                style={styles.input}
+                placeholder="Vendor, notes, cost centre"
+                value={search}
+                onChange={(e) => setSearch(e.target.value)}
+              />
 
               <label style={styles.label}>Status</label>
-              <select style={styles.input} value={statusFilter} onChange={(e) => setStatusFilter(e.target.value)}>
+              <select
+                style={styles.input}
+                value={statusFilter}
+                onChange={(e) => setStatusFilter(e.target.value)}
+              >
                 <option>All</option>
                 <option>Pending</option>
                 <option>Approved</option>
               </select>
 
               <label style={styles.label}>Financial year</label>
-              <select style={styles.input} value={financialYearFilter} onChange={(e) => setFinancialYearFilter(e.target.value)}>
+              <select
+                style={styles.input}
+                value={financialYearFilter}
+                onChange={(e) => setFinancialYearFilter(e.target.value)}
+              >
                 <option>All</option>
-                {financialYears.map((fy) => <option key={fy}>{fy}</option>)}
+                {financialYears.map((fy) => (
+                  <option key={fy}>{fy}</option>
+                ))}
               </select>
             </div>
 
             <div style={styles.card}>
               <h2>Totals by category</h2>
-              {categoryTotals.length === 0 ? <p style={styles.muted}>No totals yet.</p> : categoryTotals.map((row) => (
-                <div key={row.category} style={styles.receiptRow}>
-                  <span>{row.category}</span>
-                  <strong>{money(row.total)}</strong>
-                </div>
-              ))}
+              {categoryTotals.length === 0 ? (
+                <p style={styles.muted}>No totals yet.</p>
+              ) : (
+                categoryTotals.map((row) => (
+                  <div key={row.category} style={styles.receiptRow}>
+                    <span>{row.category}</span>
+                    <strong>{money(row.total)}</strong>
+                  </div>
+                ))
+              )}
             </div>
           </div>
 
           <div style={styles.rightCol}>
             <div style={styles.card}>
               <h2>Receipts</h2>
-              {filteredReceipts.length === 0 ? <p style={styles.muted}>No receipts yet.</p> : filteredReceipts.map((receipt) => (
-                <div key={receipt.id} style={styles.receiptBlock}>
-                  <div>
-                    <strong>{receipt.vendor}</strong>
-                    <div style={styles.smallMuted}>{receipt.receipt_date} · {receipt.status} · {receipt.financial_year || '-'} · {receipt.cost_centre || 'No cost centre'}</div>
-                    {receipt.notes ? <div style={styles.smallMuted}>{receipt.notes}</div> : null}
+              {filteredReceipts.length === 0 ? (
+                <p style={styles.muted}>No receipts yet.</p>
+              ) : (
+                filteredReceipts.map((receipt) => (
+                  <div key={receipt.id} style={styles.receiptBlock}>
+                    <div>
+                      <strong>{receipt.vendor}</strong>
+                      <div style={styles.smallMuted}>
+                        {receipt.receipt_date} · {receipt.status} ·{' '}
+                        {receipt.financial_year || '-'} ·{' '}
+                        {receipt.cost_centre || 'No cost centre'}
+                      </div>
+                      {receipt.notes ? (
+                        <div style={styles.smallMuted}>{receipt.notes}</div>
+                      ) : null}
+                    </div>
+                    <div style={styles.receiptActionCol}>
+                      <strong>{money(receipt.amount)}</strong>
+                      {receipt.status !== 'Approved' ? (
+                        <button
+                          style={styles.button}
+                          onClick={() => approveReceipt(receipt.id)}
+                        >
+                          Approve
+                        </button>
+                      ) : null}
+                    </div>
                   </div>
-                  <div style={styles.receiptActionCol}>
-                    <strong>{money(receipt.amount)}</strong>
-                    {receipt.status !== 'Approved' ? <button style={styles.button} onClick={() => approveReceipt(receipt.id)}>Approve</button> : null}
-                  </div>
-                </div>
-              ))}
+                ))
+              )}
             </div>
           </div>
         </div>
@@ -592,6 +895,14 @@ const styles = {
   info: {
     color: '#155724',
     marginTop: '12px',
+  },
+  infoBanner: {
+    background: '#e6f7ed',
+    color: '#166534',
+    border: '1px solid #b7e4c7',
+    padding: '12px 14px',
+    borderRadius: '12px',
+    marginBottom: '16px',
   },
   errorText: {
     color: '#b00020',
